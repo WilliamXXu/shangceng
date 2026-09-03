@@ -36,6 +36,9 @@ Then open **http://localhost:8765**.
   images, video/audio, text & markdown (up to ~1 MB), plus metadata and an
   "Open with macOS" button (equivalent to double-clicking in Finder).
 - **Status bar** with item count, bytes in files, and free disk space.
+- **AI display names** (`summarizer.py`): the ✨ (auto_awesome) toolbar button
+  has the LLM invent a short, sensible display name for every text file in the
+  current folder and shows those names in place of the real ones — see below.
 - Errors are handled: permission-denied folders show a lock card with a hint about
   macOS Full Disk Access.
 - **LLM chat panel** (`llm_panel.py`): a streaming chat in a right-hand drawer
@@ -85,16 +88,43 @@ calls surface the provider's error message in the chat and don't pollute the
 history. Chat state lives per browser tab (in memory) — a refresh starts a
 new chat, matching the demo's stateless style.
 
-### Testing the panel
+## AI display names
 
-`test_llm_panel.py` runs the real app in-process against NiceGUI's official
-`User` simulation — no browser needed. Agent CLI streams are stubbed at the
-`agents` module boundary; `FINDER_TEST_REAL_AGENTS=1` additionally runs one
-REAL `opencode run` end-to-end through the panel (spends CLI quota):
+The ✨ toolbar button turns `quarterly_budget_v3_FINAL.txt` into
+"Quarterly budget report": it asks the LLM (the chat panel's current
+provider/model) for a short name describing each file's content and displays
+those names in the icon and list views. Clicking again toggles back to the
+real names (hovering an AI name shows the real one as a tooltip).
+
+- **One file at a time**: a linear progress bar in the footer fills file by
+  file ("Summarizing 3/17 · notes.txt"); a stop button halts the run —
+  everything already summarized is kept.
+- **Cached in `~/.shangceng/filenames.json`**: every finished summary is
+  saved immediately (atomic write), so re-runs and later visits are instant —
+  only new or modified files (mtime/size changed) hit the LLM again.
+- **Text formats only**: files whose extension is in the app's `TEXT_TYPES`
+  set (`.txt`, `.md`, `.py`, `.json`, …) up to 1 MB are summarized; images,
+  videos and other binaries keep their real names. Only the first 200 KB of
+  a file is read, and the prompt carries the first 24 KB (the agent argv cap).
+- **Privacy**: files whose names look like secrets (`.env`, `*secret*`,
+  `*credential*`, `*password*`, `*token*`, `id_rsa`, `private_key`) are never
+  sent to the LLM, even with "show hidden files" on. Jobs are capped at
+  200 files per run.
+- Failures are never cached, so the next run retries them. Set
+  `SHANGCENG_HOME` to move the cache folder (tests use this).
+
+### Testing
+
+`test_llm_panel.py` covers the chat panel and `test_summarizer.py` the AI
+names — both run the real app in-process against NiceGUI's official `User`
+simulation, no browser needed. LLM streams are stubbed (at the `agents`
+boundary for the chat, at `summarizer.make_stream_fn` for summaries);
+`FINDER_TEST_REAL_AGENTS=1` additionally runs one REAL `opencode run`
+end-to-end through the chat panel (spends CLI quota):
 
 ```bash
 .venv/bin/pip install pytest pytest-asyncio   # test-only deps
-.venv/bin/pytest test_llm_panel.py -v
+.venv/bin/pytest test_llm_panel.py test_summarizer.py -v
 ```
 
 Everything is **read-only** — no rename/move/delete anywhere. (The agent

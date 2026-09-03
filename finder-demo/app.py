@@ -8,6 +8,11 @@ Run:
 
 Read-only: nothing is renamed, moved or deleted. "Open with macOS" only
 launches a file with its default app, like double-clicking in Finder.
+
+The "auto_awesome" toolbar button generates AI display names for the current
+folder's text files (one LLM call each, progress in the footer) and shows
+them in place of the real names; summaries are cached in ~/.shangceng so
+repeats are instant — see summarizer.py.
 """
 from __future__ import annotations
 
@@ -21,9 +26,10 @@ import sys
 import urllib.parse
 from pathlib import Path
 
-from nicegui import app, ui
+from nicegui import app, run, ui
 
 from llm_panel import ChatPanel
+import summarizer
 
 PORT = 8765
 HOME = Path.home().resolve()
@@ -48,6 +54,11 @@ TEXT_TYPES = {
     '.m', '.mm', '.swift', '.kt', '.java', '.rb', '.go', '.rs', '.php', '.pl',
     '.lua', '.gitignore', '.gitattributes', '.editorconfig', '.lock',
 }
+
+# AI name summaries: text files up to this size, capped per job so a huge
+# folder can't keep the LLM busy forever.
+MAX_SUMMARY_BYTES = 1_000_000
+MAX_SUMMARY_TARGETS = 200
 
 SUFFIX_ICONS = {
     '.py': ('code', 'blue-7'), '.ipynb': ('code', 'blue-7'), '.sh': ('code', 'blue-7'),
@@ -173,9 +184,11 @@ def scan(folder: Path, show_hidden: bool, query: str, sort: str):
 def index():
     ui.dark_mode(False)  # Finder look: force light even if the browser prefers dark
     ui.add_head_html(PAGE_BG_STYLE)
-    state = {'cwd': HOME, 'view': 'grid', 'search': '', 'show_hidden': False, 'sort': 'name'}
+    state = {'cwd': HOME, 'view': 'grid', 'search': '', 'show_hidden': False, 'sort': 'name',
+             'ai_names': False}
     history = [HOME]
     hidx = [0]
+    job = {'running': False, 'cancel': False}  # AI name-summary job
 
     # ---- behaviour (defined first; UI elements below are closed over) ------
 
@@ -224,6 +237,101 @@ def index():
         hidden_btn.props('icon=visibility color=primary' if state['show_hidden']
                          else 'icon=visibility_off color=grey-7')
         render_content()
+
+    # ---- AI display names ----------------------------------------------------
+
+    def set_ai_names(on: bool):
+        state['ai_names'] = on
+        ai_btn.props('color=primary' if on else 'color=grey-7')
+        render_content()
+
+    def summary_targets() -> tuple[list[dict], int]:
+        """(files still needing a summary, total summarizable text files).
+
+        The count is -1 when the folder could not be scanned.
+        """
+        entries, err, _ = scan(state['cwd'], state['show_hidden'], '', state['sort'])
+        if err is not None:
+            return [], -1
+        text_files = [e for e in entries
+                      if not e['is_dir']
+                      and Path(e['name']).suffix.lower() in TEXT_TYPES
+                      and e['size'] <= MAX_SUMMARY_BYTES
+                      and not summarizer.is_sensitive(e['name'])]
+        todo = [e for e in text_files
+                if summarizer.store.get(e['path'], e['mtime'], e['size']) is None]
+        return todo[:MAX_SUMMARY_TARGETS], len(text_files)
+
+    def cancel_summary():
+        job['cancel'] = True
+
+    async def on_ai_names():
+        """Toolbar button: toggle AI names off, or summarize then switch on."""
+        if job['running']:
+            return
+        if state['ai_names']:
+            set_ai_names(False)
+            return
+
+        # Flag the job before the first await: NiceGUI schedules every click as
+        # its own task, so a double-click would otherwise start two jobs.
+        job['running'] = True
+        job['cancel'] = False
+        ai_btn.props('disable')
+        try:
+            try:
+                await chat.ensure_models()
+                stream_fn = summarizer.make_stream_fn(chat)
+            except Exception as e:
+                ui.notify(f'AI names need a working LLM: {e}', type='warning')
+                return
+
+            todo, text_count = summary_targets()
+            if not todo:
+                if text_count == 0:
+                    ui.notify('No text files to name here — only text formats '
+                              'are summarized', type='info', timeout=2500)
+                else:
+                    set_ai_names(True)
+                    ui.notify(f'All {text_count} file name(s) already summarized '
+                              '— showing AI names', type='positive', timeout=2000)
+                return
+
+            progress_box.classes(remove='hidden')
+            total = len(todo)
+            done = failed = 0
+            for i, entry in enumerate(todo):
+                if job['cancel']:
+                    break
+                progress_bar.value = i / total
+                progress_label.text = f'Summarizing {i + 1}/{total} · {entry["name"]}'
+                try:
+                    summary = await run.io_bound(summarizer.summarize_file,
+                                                 entry['path'], stream_fn)
+                    if summary:
+                        summarizer.store.put(entry['path'], summary, entry['mtime'],
+                                             entry['size'], chat.provider)
+                        summarizer.store.save()  # per file: a stop loses nothing
+                        done += 1
+                    else:
+                        failed += 1
+                except Exception:
+                    failed += 1  # failures are not cached — next run retries them
+            progress_bar.value = 1.0
+
+            if job['cancel']:
+                ui.notify(f'Stopped — {done} of {total} name(s) summarized',
+                          type='warning', timeout=3000)
+            elif failed:
+                ui.notify(f'{done} name(s) summarized, {failed} failed',
+                          type='warning', timeout=3000)
+            else:
+                ui.notify(f'{done} name(s) summarized', type='positive', timeout=2000)
+            set_ai_names(True)  # show whatever is cached, even after a partial run
+        finally:
+            job['running'] = False
+            ai_btn.props(remove='disable')
+            progress_box.classes('hidden')
 
     def open_entry(entry: dict):
         if entry['is_dir']:
@@ -285,6 +393,12 @@ def index():
         content.clear()
         entries, err, total = scan(state['cwd'], state['show_hidden'], state['search'],
                                    state['sort'])
+        if state['ai_names']:  # decorate with cached AI names where available
+            for e in entries:
+                if not e['is_dir']:
+                    summary = summarizer.store.get(e['path'], e['mtime'], e['size'])
+                    if summary:
+                        e['display'] = summary
         try:
             free_h = human_size(shutil.disk_usage(state['cwd']).free)
         except OSError:
@@ -322,8 +436,11 @@ def index():
                         .classes('w-[104px] h-[104px] rounded-lg hover:bg-black/5'):
                     with ui.column().classes('items-center justify-start gap-1 w-full'):
                         ui.icon(entry['icon'], color=entry['icon_color']).classes('text-[40px]')
-                        ui.label(entry['name']) \
-                            .classes('text-[11px] leading-tight break-all line-clamp-2 text-gray-800')
+                        label = ui.label(entry.get('display') or entry['name']) \
+                            .classes('text-[11px] leading-tight break-all line-clamp-2 '
+                                     'text-gray-800')
+                        if entry.get('display'):
+                            label.tooltip(f'{entry["name"]} — AI name')
             if len(entries) > 2000:
                 ui.label(f'… and {len(entries) - 2000:,} more — narrow with search') \
                     .classes('text-xs text-gray-400 p-2')
@@ -343,6 +460,12 @@ def index():
         table.add_slot('body-cell-icon', '''
             <q-td :props="props" style="width: 32px">
               <q-icon :name="props.row.icon" :color="props.row.icon_color" size="22px"/>
+            </q-td>''')
+        # Name cell shows the AI display name (when set); hover reveals the real one
+        table.add_slot('body-cell-name', '''
+            <q-td :props="props">
+              <span :title="props.row.display ? props.row.name + ' — AI name'
+                                                    : props.row.name">{{ props.row.display || props.row.name }}</span>
             </q-td>''')
         if len(entries) > 2000:
             ui.label(f'… and {len(entries) - 2000:,} more — narrow with search') \
@@ -427,6 +550,10 @@ def index():
             list_btn.props('flat dense').tooltip('List view')
             hidden_btn = ui.button(icon='visibility_off', on_click=toggle_hidden)
             hidden_btn.props('flat dense').tooltip('Show hidden files')
+            ai_btn = ui.button(icon='auto_awesome', on_click=on_ai_names)
+            ai_btn.props('flat dense').tooltip('AI display names — summarize the '
+                                               "current folder's text files") \
+                .mark('ai-names-btn')
             chat_btn = ui.button(icon='forum', on_click=chat.toggle)
             chat_btn.props('flat dense').tooltip('LLM chat')
 
@@ -437,6 +564,14 @@ def index():
         with ui.row().classes('w-full items-center'):
             items_label = ui.label('…').classes('text-xs')
             ui.space()
+            with ui.row().classes('items-center gap-2 hidden') as progress_box:
+                progress_bar = ui.linear_progress(value=0, show_value=False).classes('w-44')
+                progress_label = ui.label('').classes('text-xs text-gray-600') \
+                    .mark('ai-progress')
+                ui.button(icon='stop_circle', on_click=cancel_summary) \
+                    .props('flat dense round size=sm color=negative') \
+                    .tooltip('Stop after the current file — finished names are kept') \
+                    .mark('ai-stop-btn')
             ui.label('Read-only NiceGUI demo').classes('text-[11px] text-gray-400')
 
     with ui.column().classes('w-full p-4 gap-2') as content:
@@ -446,6 +581,7 @@ def index():
     grid_btn.props('color=primary')
     list_btn.props('color=grey-7')
     hidden_btn.props('color=grey-7')
+    ai_btn.props('color=grey-7')
     navigate(HOME, push=False)
 
 

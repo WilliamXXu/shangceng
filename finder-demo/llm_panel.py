@@ -306,6 +306,13 @@ class ChatPanel:
                 and self.provider not in self._models_loaded:
             await self._discover(self.provider)
 
+    async def ensure_models(self):
+        """Fetch the provider's model catalog if its picker is still empty —
+        used by the AI-name summarizer before its first run."""
+        if self.provider in self.AUTO_DISCOVER \
+                and self.provider not in self._models_loaded:
+            await self._discover(self.provider)
+
     def chat_about_file(self, path: Path | str, text: str):
         """Attach a document as context and start a fresh chat about it."""
         path = Path(path)
